@@ -507,7 +507,7 @@ def register_user(user_data):
             reader = csv.DictReader(file)
             for row in reader:
                 if row['email'] == user_data.get('email'):
-                    return {'success': False, 'error': 'Email already registered'}
+                    return {'success': False, 'error': 'Email already registered. Please open a new incognito tab to continue.'}
         
         # Add new user
         user_id = str(uuid.uuid4())
@@ -524,7 +524,7 @@ def register_user(user_data):
                 datetime.now().isoformat()
             ])
         
-        return {'success': True, 'message': 'User registered successfully'}
+        return {'success': True, 'message': 'User registered successfully. Please open a new incognito tab to continue.'}
     except Exception as e:
         print(f"Error registering user: {e}")
         return {'success': False, 'error': str(e)}
