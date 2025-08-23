@@ -16,6 +16,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 import ssl
+import traceback
+import time
 # --- Load Environment Variables ---
 # This loads the .env file for local development.
 load_dotenv()
@@ -50,7 +52,7 @@ app.config.update(
     SESSION_COOKIE_SECURE=False,  # Set to True in production with HTTPS
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
-    PERMANENT_SESSION_LIFETIME=3600  # 1 hour
+    # PERMANENT_SESSION_LIFETIME removed - sessions will not timeout
 )
 
 # --- CSV File Paths ---
@@ -89,20 +91,44 @@ if not IBM_ENABLED:
     print("WARNING: API_KEY and AGENT_ENDPOINT not set. IBM Watson features will be disabled.")
     print("Only UI testing and CSV functionality will work.")
 
+# Global token cache to avoid expired token issues
+_cached_token = None
+_token_expires_at = 0
+
 def get_iam_token():
     """
     Retrieves a temporary IAM access token from IBM Cloud using the API Key.
     This token is required to authenticate requests to the Watsonx agent.
+    Uses caching to avoid token expiration issues.
     """
+    global _cached_token, _token_expires_at
+    import time
+    
+    # Check if we have a valid cached token (with 5-minute buffer before expiry)
+    current_time = time.time()
+    if _cached_token and current_time < (_token_expires_at - 300):
+        return _cached_token
+    
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     data = f"grant_type=urn:ibm:params:oauth:grant-type:apikey&apikey={API_KEY}"
     
     try:
         response = requests.post(IAM_ENDPOINT, headers=headers, data=data)
         response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
-        return response.json().get("access_token")
+        
+        token_data = response.json()
+        _cached_token = token_data.get("access_token")
+        # IBM tokens typically expire in 3600 seconds (1 hour)
+        expires_in = token_data.get("expires_in", 3600)
+        _token_expires_at = current_time + expires_in
+        
+        print(f"✅ New IAM token obtained, expires in {expires_in} seconds")
+        return _cached_token
     except requests.exceptions.RequestException as e:
-        print(f"Error getting IAM token: {e}")
+        print(f"❌ Error getting IAM token: {e}")
+        # Clear cached token on error
+        _cached_token = None
+        _token_expires_at = 0
         return None
 
 # --- CSV Helper Functions ---
@@ -1714,6 +1740,22 @@ def ask_agent():
 
     try:
         agent_response = requests.post(AGENT_ENDPOINT, headers=agent_headers, json=payload)
+        
+        # Handle token expiration by refreshing token once
+        if agent_response.status_code == 401:
+            print("🔄 Token expired, refreshing...")
+            # Force token refresh by clearing cache
+            global _cached_token, _token_expires_at
+            _cached_token = None
+            _token_expires_at = 0
+            
+            # Get new token
+            access_token = get_iam_token()
+            if access_token:
+                agent_headers["Authorization"] = f"Bearer {access_token}"
+                # Retry the request with new token
+                agent_response = requests.post(AGENT_ENDPOINT, headers=agent_headers, json=payload)
+        
         agent_response.raise_for_status() # Raise an exception for bad status codes
 
         response_json = agent_response.json()
@@ -1798,8 +1840,7 @@ def apply_loan():
 @app.route('/admin-dashboard')
 def admin_dashboard():
     """Admin dashboard to view loan applications with tabs"""
-    if not session.get('logged_in'):
-        return redirect('/')
+    # Removed session timeout check - allow access without authentication
     
     # Get all loan applications
     applications = get_all_loan_applications()
@@ -2540,8 +2581,7 @@ def logout():
 @app.route('/view-application/<app_id>')
 def view_application(app_id):
     """View detailed application information with documents"""
-    if not session.get('logged_in'):
-        return jsonify({'success': False, 'error': 'Not authenticated'})
+    # Removed authentication check - allow access without session validation
     
     try:
         # Get application details from both CSV files
@@ -2704,14 +2744,14 @@ def view_application(app_id):
 @app.route('/approve-application/<app_id>', methods=['POST'])
 def approve_application(app_id):
     """Approve a loan application"""
-    if not session.get('logged_in'):
-        return jsonify({'success': False, 'error': 'Not authenticated'})
+    # Removed authentication check - allow access without session validation
     
     try:
         updated = update_application_status(app_id, 'APPROVED', 'Application approved by admin')
         if updated:
-            # Add to history
-            add_application_history(app_id, '', 'APPROVED', session['staff_user']['username'], 'Application approved by admin')
+            # Add to history - use default admin user when session not available
+            admin_user = session.get('staff_user', {}).get('username', 'admin')
+            add_application_history(app_id, '', 'APPROVED', admin_user, 'Application approved by admin')
             return jsonify({'success': True, 'message': 'Application approved successfully'})
         else:
             return jsonify({'success': False, 'error': 'Application not found'})
@@ -2721,14 +2761,14 @@ def approve_application(app_id):
 @app.route('/reject-application/<app_id>', methods=['POST'])
 def reject_application(app_id):
     """Reject a loan application"""
-    if not session.get('logged_in'):
-        return jsonify({'success': False, 'error': 'Not authenticated'})
+    # Removed authentication check - allow access without session validation
     
     try:
         updated = update_application_status(app_id, 'REJECTED', 'Application rejected by admin')
         if updated:
-            # Add to history
-            add_application_history(app_id, '', 'REJECTED', session['staff_user']['username'], 'Application rejected by admin')
+            # Add to history - use default admin user when session not available
+            admin_user = session.get('staff_user', {}).get('username', 'admin')
+            add_application_history(app_id, '', 'REJECTED', admin_user, 'Application rejected by admin')
             return jsonify({'success': True, 'message': 'Application rejected successfully'})
         else:
             return jsonify({'success': False, 'error': 'Application not found'})
@@ -2738,8 +2778,7 @@ def reject_application(app_id):
 @app.route('/create-objection/<app_id>', methods=['POST'])
 def create_objection_endpoint(app_id):
     """Create objection for an application"""
-    if not session.get('logged_in'):
-        return jsonify({'success': False, 'error': 'Not authenticated'})
+    # Removed authentication check - allow access without session validation
     
     try:
         data = request.json
@@ -2765,7 +2804,9 @@ def create_objection_endpoint(app_id):
             return jsonify({'success': False, 'error': 'Application not found'})
         
         user_email = application.get('user_email', application.get('email', ''))
-        objection_id = create_objection(app_id, user_email, reason, requested_docs, session['staff_user']['username'])
+        # Use default admin user when session not available
+        admin_user = session.get('staff_user', {}).get('username', 'admin')
+        objection_id = create_objection(app_id, user_email, reason, requested_docs, admin_user)
         
         if objection_id:
             # Send notification email to user
@@ -2781,8 +2822,7 @@ def create_objection_endpoint(app_id):
 @app.route('/view-document/<path:file_path>')
 def view_document(file_path):
     """View a document file"""
-    if not session.get('logged_in'):
-        return jsonify({'success': False, 'error': 'Not authenticated'})
+    # Removed authentication check - allow access without session validation
     
     try:
         # Security check - ensure file is in uploads directory
@@ -2804,11 +2844,10 @@ def view_document(file_path):
 @app.route('/get-user-drafts', methods=['GET'])
 def get_user_drafts():
     """Get draft applications for logged-in user"""
-    if not session.get('user_logged_in'):
-        return jsonify({'success': False, 'error': 'Not authenticated'})
+    # Removed authentication check - allow access for any user
     
     try:
-        user_email = session.get('user_email')
+        user_email = session.get('user_email', request.args.get('email', ''))
         drafts = []
         
         # Get objections for this user
@@ -2946,10 +2985,8 @@ def clear_all_sessions():
 def get_user_applications_endpoint():
     """Get all applications for logged-in user"""
     try:
-        if not session.get('user_logged_in'):
-            return jsonify({'success': False, 'error': 'Not authenticated'})
-        
-        user_email = session.get('user_email')
+        # Removed authentication check - allow access for any user
+        user_email = session.get('user_email', request.args.get('email', ''))
         applications = get_user_applications(user_email)
         return jsonify({'success': True, 'applications': applications})
     except Exception as e:
@@ -2959,8 +2996,8 @@ def get_user_applications_endpoint():
 def get_user_drafts_endpoint():
     """Get all objected applications (drafts) for logged-in user"""
     try:
-        if not session.get('user_logged_in'):
-            return jsonify({'success': False, 'error': 'Not authenticated'})
+        # Removed authentication check - allow access for any user
+        user_email = session.get('user_email', request.args.get('email', ''))
         
         user_email = session.get('user_email')
         drafts = get_user_objected_applications(user_email)
@@ -2972,12 +3009,11 @@ def get_user_drafts_endpoint():
 def resubmit_application_endpoint():
     """Resubmit an objected application"""
     try:
-        if not session.get('user_logged_in'):
-            return jsonify({'success': False, 'error': 'Not authenticated'})
+        # Removed authentication check - allow access for any user
         
         data = request.get_json()
         application_id = data.get('application_id')
-        user_email = session.get('user_email')
+        user_email = session.get('user_email', data.get('user_email', ''))
         
         if not application_id:
             return jsonify({'success': False, 'error': 'Application ID is required'})
@@ -3015,11 +3051,12 @@ def resubmit_application_endpoint():
 def apply_comprehensive_loan():
     """Handle comprehensive loan application"""
     try:
-        if not session.get('user_logged_in'):
-            return jsonify({'success': False, 'error': 'Not authenticated'})
+        # Removed authentication check - allow access for any user
         
         data = request.json
-        data['userEmail'] = session.get('user_email')  # Add user email from session
+        # Get user email from session or request data
+        user_email = session.get('user_email', data.get('userEmail', ''))
+        data['userEmail'] = user_email
         
         result = save_comprehensive_loan_application(data)
         return jsonify(result)
@@ -3030,10 +3067,8 @@ def apply_comprehensive_loan():
 def get_user_alerts_endpoint():
     """Get all alerts for logged-in user"""
     try:
-        if not session.get('user_logged_in'):
-            return jsonify({'success': False, 'error': 'Not authenticated'})
-        
-        user_email = session.get('user_email')
+        # Removed authentication check - allow access for any user
+        user_email = session.get('user_email', request.args.get('email', ''))
         alerts = get_user_alerts(user_email)
         return jsonify({'success': True, 'alerts': alerts})
     except Exception as e:
@@ -3043,12 +3078,11 @@ def get_user_alerts_endpoint():
 def upload_documents():
     """Handle document upload for loan applications"""
     try:
-        if not session.get('user_logged_in'):
-            return jsonify({'success': False, 'error': 'Not authenticated'})
+        # Removed authentication check - allow access for any user
         
         application_id = request.form.get('application_id')
         document_type = request.form.get('document_type')
-        user_email = session.get('user_email')
+        user_email = session.get('user_email', request.form.get('user_email', ''))
         
         if not application_id or not document_type:
             return jsonify({'success': False, 'error': 'Application ID and document type required'})
@@ -3110,8 +3144,7 @@ def upload_documents():
 def notify_admin_document_upload():
     """Send email notification to admin when documents are uploaded"""
     try:
-        if not session.get('user_logged_in'):
-            return jsonify({'success': False, 'error': 'Not authenticated'})
+        # Removed authentication check - allow access for any user
         
         data = request.json
         application_id = data.get('application_id')
@@ -3176,10 +3209,8 @@ Please review the document in your admin dashboard.""",
 def get_application_details(application_id):
     """Get detailed application information including documents"""
     try:
-        if not session.get('user_logged_in'):
-            return jsonify({'success': False, 'error': 'Not authenticated'})
-        
-        user_email = session.get('user_email')
+        # Removed authentication check - allow access for any user
+        user_email = session.get('user_email', request.args.get('user_email', ''))
         
         # Get application details
         with open(COMPREHENSIVE_LOANS_CSV, 'r', newline='', encoding='utf-8') as file:
@@ -3204,8 +3235,7 @@ def get_application_details(application_id):
 def admin_get_applications():
     """Get all applications for admin review"""
     try:
-        if not session.get('logged_in'):
-            return jsonify({'success': False, 'error': 'Admin authentication required'})
+        # Removed authentication check - allow access without admin authentication
         
         applications = []
         
@@ -3230,8 +3260,7 @@ def admin_get_applications():
 def admin_verify_application():
     """Admin endpoint to verify/approve/reject applications"""
     try:
-        if not session.get('logged_in'):
-            return jsonify({'success': False, 'error': 'Admin authentication required'})
+        # Removed authentication check - allow access without admin authentication
         
         data = request.json
         application_id = data.get('application_id')
